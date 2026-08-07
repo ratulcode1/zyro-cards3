@@ -1,0 +1,6 @@
+{
+  "name": "Zyro Cards - NFC Smart Card Platform",
+  "description": "Zyro Cards - Premium NFC Smart Digital Business Card platform with admin management, user dashboard, customizable themes, vCard export, and QR code generation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
