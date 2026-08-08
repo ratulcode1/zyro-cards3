@@ -1,24 +1,57 @@
 import React, { useState, useEffect } from 'react';
 import { CardProfile, AuthSession } from './types';
+import { PRESET_THEMES } from './data/mockData';
 import { Navbar } from './components/Navbar';
 import { DigitalCardView } from './components/DigitalCardView';
 import { UserDashboard } from './components/UserDashboard';
 import { AdminPanel } from './components/AdminPanel';
 import { LoginModal } from './components/LoginModal';
 import { InlineLoginBox } from './components/InlineLoginBox';
-import { BusinessGuideModal } from './components/BusinessGuideModal';
+
+const DEFAULT_INITIAL_PROFILE: CardProfile = {
+  id: 'card-joshua',
+  username: 'joshua',
+  fullName: 'Joshua Thomas',
+  jobTitle: 'Chief Executive Officer',
+  company: 'Apex Dynamics Inc.',
+  bio: 'Serial entrepreneur, tech investor, and advisor. Passionate about building scalable platforms and driving innovation.',
+  avatarUrl: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?q=80&w=1000&auto=format&fit=crop',
+  quickActions: {
+    phone: '+1 (555) 234-5678',
+    email: 'joshua@apexdynamics.com',
+    sms: '+15552345678',
+    whatsapp: '15552345678',
+  },
+  links: [
+    { id: 'l1', platform: 'whatsapp', title: 'WhatsApp Direct', subtitle: 'Chat with Joshua', url: 'https://wa.me/15552345678', active: true },
+    { id: 'l2', platform: 'linkedin', title: 'LinkedIn Profile', subtitle: 'Connect professionally', url: 'https://linkedin.com', active: true },
+    { id: 'l3', platform: 'website', title: 'Apex Dynamics', subtitle: 'Company website', url: 'https://example.com', active: true },
+  ],
+  theme: PRESET_THEMES[0],
+  vcardData: {
+    mobilePhone: '+1 (555) 234-5678',
+    workPhone: '+1 (555) 987-6543',
+    email: 'joshua@apexdynamics.com',
+    website: 'https://apexdynamics.com',
+    organization: 'Apex Dynamics Inc.',
+  },
+  stats: { totalTaps: 42, linkClicks: { whatsapp: 15, linkedin: 18, website: 9 } },
+  isActive: true,
+  createdAt: new Date().toISOString(),
+};
 
 export default function App() {
   const [profiles, setProfiles] = useState<CardProfile[]>(() => {
     const saved = localStorage.getItem('nfc_profiles');
     if (saved) {
       try {
-        return JSON.parse(saved);
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
       } catch (e) {
         console.error('Failed to parse saved profiles', e);
       }
     }
-    return [];
+    return [DEFAULT_INITIAL_PROFILE];
   });
 
   const [activeProfileId, setActiveProfileId] = useState<string>(() => {
@@ -38,7 +71,6 @@ export default function App() {
   });
 
   const [isLoginOpen, setIsLoginOpen] = useState(false);
-  const [isGuideOpen, setIsGuideOpen] = useState(false);
 
   const [appTheme, setAppTheme] = useState<'light' | 'dark'>(() => {
     const saved = localStorage.getItem('nfc_app_theme');
@@ -348,13 +380,6 @@ export default function App() {
           <p>© {new Date().getFullYear()} <strong>Zyro Cards</strong> - NFC & QR Smart Card Platform. All rights reserved.</p>
           <div className="flex items-center gap-4 text-slate-400">
             <button
-              onClick={() => setIsGuideOpen(true)}
-              className="hover:text-blue-400 transition-colors underline"
-            >
-              A-Z Business Blueprint
-            </button>
-            <span>•</span>
-            <button
               onClick={() => setIsLoginOpen(true)}
               className="hover:text-blue-400 transition-colors"
             >
@@ -370,11 +395,6 @@ export default function App() {
         onClose={() => setIsLoginOpen(false)}
         onLoginSuccess={handleLoginSuccess}
         appTheme={appTheme}
-      />
-
-      <BusinessGuideModal
-        isOpen={isGuideOpen}
-        onClose={() => setIsGuideOpen(false)}
       />
     </div>
   );
