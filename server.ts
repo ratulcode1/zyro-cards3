@@ -1,6 +1,7 @@
 import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
+import Groq from 'groq-sdk';
 import { getFirestoreDb } from './firebase.ts';
 import { PRESET_THEMES } from './src/data/mockData.ts';
 import { CardProfile, UserAccount, AdminAccount } from './src/types.ts';
@@ -9,6 +10,17 @@ const app = express();
 const PORT = 3000;
 
 app.use(express.json({ limit: '10mb' }));
+
+// ==================== GROQ AI CLIENT ====================
+let groqClient: Groq | null = null;
+function getGroqClient(): Groq | null {
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) return null;
+  if (!groqClient) {
+    groqClient = new Groq({ apiKey });
+  }
+  return groqClient;
+}
 
 // ==================== IN-MEMORY FALLBACK STORE ====================
 // Used automatically when Firestore credentials are not set
@@ -941,6 +953,177 @@ app.delete('/api/admin/admins/:adminId', async (req, res) => {
   } catch (err: any) {
     console.error('Admin deletion failed:', err?.message || err);
     res.status(500).json({ error: 'Failed to delete admin' });
+  }
+});
+
+// ==================== GROQ AI ROUTES (llama-3.3-70b-versatile) ====================
+
+// Generate Professional Bio
+app.post('/api/ai/generate-bio', async (req, res) => {
+  try {
+    const { fullName, jobTitle, company, tone = 'professional', keywords = '', existingBio = '' } = req.body;
+
+    const groq = getGroqClient();
+    if (!groq) {
+      return res.status(503).json({
+        error: 'Groq API is not configured. Please set the GROQ_API_KEY environment variable.',
+      });
+    }
+
+    const systemPrompt = `You are an elite digital business card copywriter and personal branding expert for Zyro Cards. Your task is to write a concise, compelling bio (max 2-3 sentences, 40-70 words) for a professional NFC digital card profile.
+Tone: ${tone}.
+Return ONLY the raw bio text with no quotes, markdown formatting, or introductory commentary.`;
+
+    const userPrompt = `Name: ${fullName || 'Professional'}
+Job Title: ${jobTitle || 'Expert'}
+Company: ${company || ''}
+Key Skills/Keywords: ${keywords || 'None provided'}
+Existing Bio context: ${existingBio || 'None'}`;
+
+    const completion = await groq.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      temperature: 0.7,
+      max_tokens: 250,
+    });
+
+    const bio = completion.choices[0]?.message?.content?.trim() || '';
+    res.json({ success: true, bio });
+  } catch (err: any) {
+    console.error('Groq bio generation error:', err?.message || err);
+    res.status(500).json({ error: err?.message || 'Failed to generate bio with Groq' });
+  }
+});
+
+// Suggest Social Links & Action Buttons
+app.post('/api/ai/suggest-links', async (req, res) => {
+  try {
+    const { fullName, jobTitle, company, bio } = req.body;
+
+    const groq = getGroqClient();
+    if (!groq) {
+      return res.status(503).json({
+        error: 'Groq API is not configured. Please set the GROQ_API_KEY environment variable.',
+      });
+    }
+
+    const systemPrompt = `You are a digital card optimization assistant. Suggest 3 to 5 high-converting social links and calls-to-action for a digital business card. Return a valid JSON array strictly matching this format:
+[
+  {
+    "platform": "whatsapp" | "linkedin" | "website" | "instagram" | "twitter" | "youtube" | "github" | "custom",
+    "title": "Short Title (e.g. Schedule a Meeting / Portfolio / Connect)",
+    "subtitle": "Short benefit subtitle (max 5 words)"
+  }
+]
+Output JSON array ONLY without markdown blocks or explanation.`;
+
+    const userPrompt = `Professional Details:
+Name: ${fullName || 'Professional'}
+Job Title: ${jobTitle || 'Specialist'}
+Company: ${company || 'Independent'}
+Bio: ${bio || ''}`;
+
+    const completion = await groq.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      temperature: 0.6,
+      max_tokens: 400,
+    });
+
+    let raw = completion.choices[0]?.message?.content?.trim() || '[]';
+    raw = raw.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/i, '').trim();
+
+    let suggestions = [];
+    try {
+      const parsed = JSON.parse(raw);
+      suggestions = Array.isArray(parsed) ? parsed : (parsed.suggestions || parsed.links || []);
+    } catch {
+      suggestions = [];
+    }
+
+    res.json({ success: true, suggestions });
+  } catch (err: any) {
+    console.error('Groq link suggestion error:', err?.message || err);
+    res.status(500).json({ error: err?.message || 'Failed to suggest links with Groq' });
+  }
+});
+
+// AI Assistant & Chat for NFC Cards / Networking
+app.post('/api/ai/chat', async (req, res) => {
+  try {
+    const { message, history = [] } = req.body;
+    if (!message) return res.status(400).json({ error: 'Message is required' });
+
+    const groq = getGroqClient();
+    if (!groq) {
+      return res.status(503).json({
+        error: 'Groq API is not configured. Please set the GROQ_API_KEY environment variable.',
+      });
+    }
+
+    const systemPrompt = `You are Zyro AI, the intelligent assistant for Zyro Cards (the NFC Smart Digital Business Card platform). You help entrepreneurs, sales professionals, and admins optimize their NFC cards, write elevator pitches, learn how to program NTAG215/216 chips, and grow their networking efficiency. Be concise, actionable, and friendly.`;
+
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      ...history.map((h: any) => ({
+        role: h.role === 'user' ? 'user' : 'assistant',
+        content: String(h.content || ''),
+      })),
+      { role: 'user', content: String(message) },
+    ];
+
+    const completion = await groq.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
+      messages: messages as any,
+      temperature: 0.7,
+      max_tokens: 600,
+    });
+
+    const reply = completion.choices[0]?.message?.content?.trim() || '';
+    res.json({ success: true, reply });
+  } catch (err: any) {
+    console.error('Groq chat error:', err?.message || err);
+    res.status(500).json({ error: err?.message || 'Groq AI request failed' });
+  }
+});
+
+// Generate Custom Copy & Taglines
+app.post('/api/ai/generate-copy', async (req, res) => {
+  try {
+    const { prompt, type = 'tagline' } = req.body;
+    if (!prompt) return res.status(400).json({ error: 'Prompt is required' });
+
+    const groq = getGroqClient();
+    if (!groq) {
+      return res.status(503).json({
+        error: 'Groq API is not configured. Please set the GROQ_API_KEY environment variable.',
+      });
+    }
+
+    const completion = await groq.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
+      messages: [
+        {
+          role: 'system',
+          content: `You are an expert copywriter for digital business cards. Write concise, punchy copy (${type}). Output ONLY the text.`,
+        },
+        { role: 'user', content: prompt },
+      ],
+      temperature: 0.7,
+      max_tokens: 200,
+    });
+
+    const result = completion.choices[0]?.message?.content?.trim() || '';
+    res.json({ success: true, result });
+  } catch (err: any) {
+    console.error('Groq copy generation error:', err?.message || err);
+    res.status(500).json({ error: err?.message || 'Failed to generate copy with Groq' });
   }
 });
 
