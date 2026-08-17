@@ -969,6 +969,46 @@ app.delete('/api/admin/admins/:adminId', async (req, res) => {
 
 // ==================== AI ROUTES (GEMINI & GROQ) ====================
 
+// Helper to reliably execute Groq calls with automatic fallback to standard available models
+async function callGroqWithFallback(groq: any, options: {
+  messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>;
+  response_format?: { type: 'json_object' };
+  temperature?: number;
+  max_tokens?: number;
+}) {
+  const candidateModels = [
+    'llama-3.3-70b-versatile',
+    'llama-3.1-8b-instant',
+    'llama3-8b-8192',
+    'llama3-70b-8192',
+    'mixtral-8x7b-32768',
+  ];
+
+  let lastError: any = null;
+  for (const modelName of candidateModels) {
+    try {
+      const completion = await groq.chat.completions.create({
+        model: modelName,
+        messages: options.messages as any,
+        response_format: options.response_format,
+        temperature: options.temperature ?? 0.1,
+        ...(options.max_tokens ? { max_tokens: options.max_tokens } : {}),
+      });
+      return completion;
+    } catch (err: any) {
+      lastError = err;
+      const msg = err?.message || String(err);
+      const isNotFoundError = err?.status === 404 || msg.includes('does not exist') || msg.includes('decommissioned') || msg.includes('not have access');
+      if (isNotFoundError) {
+        console.warn(`Groq model '${modelName}' not available (${msg}). Attempting next fallback model...`);
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastError;
+}
+
 // AI Magic Fill: Extract structured details from raw bio text
 app.post('/api/parse-bio', async (req, res) => {
   try {
@@ -994,22 +1034,38 @@ Ensure the output is strictly valid JSON matching the required schema.`;
     let parsedObject: any = {};
 
     if (groq) {
-      const completion = await groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
-        response_format: { type: 'json_object' },
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userText },
-        ],
-        temperature: 0.1,
-      });
-
-      const rawContent = completion.choices[0]?.message?.content?.trim() || '{}';
       try {
-        parsedObject = JSON.parse(rawContent);
-      } catch (e) {
-        console.error('Failed to parse Groq response as JSON:', rawContent);
-        parsedObject = {};
+        const completion = await callGroqWithFallback(groq, {
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userText },
+          ],
+          response_format: { type: 'json_object' },
+          temperature: 0.1,
+        });
+
+        const rawContent = completion.choices[0]?.message?.content?.trim() || '{}';
+        try {
+          parsedObject = JSON.parse(rawContent);
+        } catch (e) {
+          console.error('Failed to parse Groq response as JSON:', rawContent);
+          parsedObject = {};
+        }
+      } catch (groqErr: any) {
+        console.error('Groq parsing failed, falling back to Gemini if configured:', groqErr?.message || groqErr);
+        if (gemini) {
+          const response = await gemini.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: `${systemPrompt}\n\nUser input text to extract from:\n${userText}`,
+            config: {
+              responseMimeType: 'application/json',
+            },
+          });
+          const rawContent = response.text?.trim() || '{}';
+          parsedObject = JSON.parse(rawContent);
+        } else {
+          throw groqErr;
+        }
       }
     } else if (gemini) {
       const response = await gemini.models.generateContent({
@@ -1070,8 +1126,7 @@ Existing Bio context: ${existingBio || 'None'}`;
     }
 
     if (groq) {
-      const completion = await groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
+      const completion = await callGroqWithFallback(groq, {
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt },
@@ -1127,8 +1182,7 @@ Bio: ${bio || ''}`;
       });
       raw = response.text?.trim() || '[]';
     } else if (groq) {
-      const completion = await groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
+      const completion = await callGroqWithFallback(groq, {
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt },
@@ -1199,8 +1253,7 @@ app.post('/api/ai/chat', async (req, res) => {
         { role: 'user', content: String(message) },
       ];
 
-      const completion = await groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
+      const completion = await callGroqWithFallback(groq, {
         messages: messages as any,
         temperature: 0.7,
         max_tokens: 600,
@@ -1242,8 +1295,7 @@ app.post('/api/ai/generate-copy', async (req, res) => {
     }
 
     if (groq) {
-      const completion = await groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
+      const completion = await callGroqWithFallback(groq, {
         messages: [
           {
             role: 'system',
