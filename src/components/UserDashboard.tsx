@@ -62,6 +62,181 @@ export const UserDashboard: React.FC<Props> = ({
   const [newPassword, setNewPassword] = useState('');
   const [passMsg, setPassMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
+  // AI Magic Fill state
+  const [magicInput, setMagicInput] = useState('');
+  const [isParsing, setIsParsing] = useState(false);
+  const [magicMsg, setMagicMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  const handleMagicFill = async () => {
+    if (!magicInput.trim()) {
+      setMagicMsg({ type: 'error', text: 'Please paste some raw info first.' });
+      return;
+    }
+
+    setIsParsing(true);
+    setMagicMsg(null);
+
+    try {
+      const res = await fetch('/api/parse-bio', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${authToken}`,
+        },
+        body: JSON.stringify({ userText: magicInput }),
+      });
+
+      const json = await res.json();
+      if (!res.ok || !json.success || !json.data) {
+        throw new Error(json.error || 'Failed to parse information');
+      }
+
+      const data = json.data;
+
+      // Direct profile fields
+      const updatedFullName = (data.name && typeof data.name === 'string' && data.name.trim()) ? data.name.trim() : cardData.fullName;
+      const updatedJobTitle = (data.title && typeof data.title === 'string' && data.title.trim()) ? data.title.trim() : cardData.jobTitle;
+      const updatedBio = (data.bio && typeof data.bio === 'string' && data.bio.trim()) ? data.bio.trim() : cardData.bio;
+      
+      const parsedEmail = (data.email && typeof data.email === 'string' && data.email.trim()) ? data.email.trim() : '';
+      const parsedPhone = (data.phone && typeof data.phone === 'string' && data.phone.trim()) ? data.phone.trim() : '';
+      const parsedWhatsapp = (data.whatsapp && typeof data.whatsapp === 'string' && data.whatsapp.trim()) 
+        ? data.whatsapp.trim().replace(/[^0-9+]/g, '') 
+        : (parsedPhone ? parsedPhone.replace(/[^0-9+]/g, '') : '');
+      const parsedWebsite = (data.website && typeof data.website === 'string' && data.website.trim()) ? data.website.trim() : '';
+
+      // Update quickActions
+      const nextQuickActions = {
+        ...cardData.quickActions,
+        ...(parsedEmail ? { email: parsedEmail } : {}),
+        ...(parsedPhone ? { phone: parsedPhone, sms: parsedPhone } : {}),
+        ...(parsedWhatsapp ? { whatsapp: parsedWhatsapp } : {}),
+      };
+
+      // Update vcardData
+      const nextVcard = {
+        ...cardData.vcardData,
+        ...(parsedEmail ? { email: parsedEmail } : {}),
+        ...(parsedPhone ? { mobilePhone: parsedPhone } : {}),
+        ...(parsedWebsite ? { website: parsedWebsite } : {}),
+      };
+
+      // Map social links
+      const parsedSocials: Array<{ platform: SocialLink['platform']; url?: string; title: string; defaultSubtitle: string }> = [
+        {
+          platform: 'whatsapp',
+          url: parsedWhatsapp 
+            ? (parsedWhatsapp.startsWith('http') ? parsedWhatsapp : `https://wa.me/${parsedWhatsapp.replace(/[^0-9]/g, '')}`) 
+            : undefined,
+          title: 'WhatsApp Direct',
+          defaultSubtitle: 'Chat with me',
+        },
+        {
+          platform: 'linkedin',
+          url: (data.linkedin && typeof data.linkedin === 'string' && data.linkedin.trim())
+            ? (data.linkedin.trim().startsWith('http') ? data.linkedin.trim() : `https://linkedin.com/in/${data.linkedin.trim().replace(/^@/, '')}`)
+            : undefined,
+          title: 'LinkedIn',
+          defaultSubtitle: 'Connect professionally',
+        },
+        {
+          platform: 'facebook',
+          url: (data.facebook && typeof data.facebook === 'string' && data.facebook.trim())
+            ? (data.facebook.trim().startsWith('http') ? data.facebook.trim() : `https://facebook.com/${data.facebook.trim().replace(/^@/, '')}`)
+            : undefined,
+          title: 'Facebook',
+          defaultSubtitle: 'Follow on Facebook',
+        },
+        {
+          platform: 'instagram',
+          url: (data.instagram && typeof data.instagram === 'string' && data.instagram.trim())
+            ? (data.instagram.trim().startsWith('http') ? data.instagram.trim() : `https://instagram.com/${data.instagram.trim().replace(/^@/, '')}`)
+            : undefined,
+          title: 'Instagram',
+          defaultSubtitle: 'Follow on Instagram',
+        },
+        {
+          platform: 'twitter',
+          url: (data.twitter && typeof data.twitter === 'string' && data.twitter.trim())
+            ? (data.twitter.trim().startsWith('http') ? data.twitter.trim() : `https://x.com/${data.twitter.trim().replace(/^@/, '')}`)
+            : undefined,
+          title: 'Twitter / X',
+          defaultSubtitle: 'Follow on X',
+        },
+        {
+          platform: 'youtube',
+          url: (data.youtube && typeof data.youtube === 'string' && data.youtube.trim())
+            ? (data.youtube.trim().startsWith('http') ? data.youtube.trim() : `https://youtube.com/${data.youtube.trim().startsWith('@') ? data.youtube.trim() : `@${data.youtube.trim()}`}`)
+            : undefined,
+          title: 'YouTube',
+          defaultSubtitle: 'Subscribe on YouTube',
+        },
+        {
+          platform: 'github',
+          url: (data.github && typeof data.github === 'string' && data.github.trim())
+            ? (data.github.trim().startsWith('http') ? data.github.trim() : `https://github.com/${data.github.trim().replace(/^@/, '')}`)
+            : undefined,
+          title: 'GitHub',
+          defaultSubtitle: 'View repositories',
+        },
+        {
+          platform: 'website',
+          url: parsedWebsite 
+            ? (parsedWebsite.startsWith('http') ? parsedWebsite : `https://${parsedWebsite}`) 
+            : undefined,
+          title: 'Official Website',
+          defaultSubtitle: 'Visit my website',
+        },
+      ];
+
+      let updatedLinks = [...cardData.links];
+      for (const item of parsedSocials) {
+        if (!item.url) continue;
+
+        const existingIdx = updatedLinks.findIndex(l => l.platform === item.platform);
+        if (existingIdx >= 0) {
+          updatedLinks[existingIdx] = {
+            ...updatedLinks[existingIdx],
+            url: item.url,
+            active: true,
+          };
+        } else {
+          updatedLinks.push({
+            id: 'l-' + Date.now() + '-' + Math.random().toString(36).substring(2, 6),
+            platform: item.platform,
+            title: item.title,
+            subtitle: item.defaultSubtitle,
+            url: item.url,
+            active: true,
+          });
+        }
+      }
+
+      setCardData(prev => ({
+        ...prev,
+        fullName: updatedFullName,
+        jobTitle: updatedJobTitle,
+        bio: updatedBio,
+        quickActions: nextQuickActions,
+        vcardData: nextVcard,
+        links: updatedLinks,
+      }));
+
+      setMagicMsg({
+        type: 'success',
+        text: '✨ Auto-fill complete! Direct fields & social links updated. Click "Save All Changes" to persist.',
+      });
+    } catch (err: any) {
+      console.error('Magic Fill error:', err);
+      setMagicMsg({
+        type: 'error',
+        text: err?.message || 'Failed to auto-parse details.',
+      });
+    } finally {
+      setIsParsing(false);
+    }
+  };
+
   // New social link state
   const [newPlatform, setNewPlatform] = useState<SocialLink['platform']>('facebook');
   const [newTitle, setNewTitle] = useState('');
@@ -463,6 +638,69 @@ export const UserDashboard: React.FC<Props> = ({
                   className={inputClass}
                   placeholder="Describe what you do or your slogan..."
                 />
+              </div>
+
+              {/* AI Magic Fill Section */}
+              <div className={`p-4 sm:p-5 rounded-2xl border transition-all ${
+                isDark 
+                  ? 'bg-gradient-to-br from-indigo-950/30 via-slate-900 to-purple-950/20 border-indigo-500/30 shadow-inner' 
+                  : 'bg-gradient-to-br from-indigo-50/60 via-slate-50 to-purple-50/60 border-indigo-200 shadow-xs'
+              }`}>
+                <div className="flex items-center gap-2 mb-2.5">
+                  <div className={`w-7 h-7 rounded-lg flex items-center justify-center ${isDark ? 'bg-indigo-500/20 text-indigo-300' : 'bg-indigo-100 text-indigo-600'}`}>
+                    <Sparkles className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <h3 className={`text-xs font-bold ${isDark ? 'text-indigo-200' : 'text-indigo-900'}`}>
+                      AI Magic Fill (Auto-populate Profile & Social Links)
+                    </h3>
+                    <p className={`text-[11px] ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+                      Paste raw bio text, business card notes, or contact info to instantly auto-fill all matching fields.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="space-y-3">
+                  <textarea
+                    rows={3}
+                    value={magicInput}
+                    onChange={e => setMagicInput(e.target.value)}
+                    className={inputClass}
+                    placeholder="Paste your raw info here (Name, Phone, WhatsApp, Email, Facebook, LinkedIn, Twitter, Instagram, etc.)..."
+                  />
+
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <button
+                      type="button"
+                      onClick={handleMagicFill}
+                      disabled={isParsing || !magicInput.trim()}
+                      className="px-4 py-2.5 bg-gradient-to-r from-indigo-600 via-blue-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 text-white rounded-xl font-bold text-xs sm:text-sm shadow-md transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer shrink-0"
+                    >
+                      {isParsing ? (
+                        <>
+                          <RefreshCw className="w-4 h-4 animate-spin" />
+                          <span>Processing with AI...</span>
+                        </>
+                      ) : (
+                        <>
+                          <Sparkles className="w-4 h-4 text-amber-300" />
+                          <span>✨ Magic Fill</span>
+                        </>
+                      )}
+                    </button>
+
+                    {magicMsg && (
+                      <div className={`text-xs font-medium px-3 py-1.5 rounded-lg flex items-center gap-1.5 transition-all ${
+                        magicMsg.type === 'success'
+                          ? isDark ? 'bg-emerald-950/60 text-emerald-300 border border-emerald-800' : 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+                          : isDark ? 'bg-rose-950/60 text-rose-300 border border-rose-800' : 'bg-rose-50 text-rose-800 border border-rose-200'
+                      }`}>
+                        {magicMsg.type === 'success' ? <Check className="w-3.5 h-3.5 shrink-0" /> : null}
+                        <span>{magicMsg.text}</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
               </div>
 
               <div>

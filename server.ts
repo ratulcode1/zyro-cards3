@@ -1,6 +1,7 @@
 import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
+import { GoogleGenAI } from '@google/genai';
 import Groq from 'groq-sdk';
 import { getFirestoreDb } from './firebase.ts';
 import { PRESET_THEMES } from './src/data/mockData.ts';
@@ -11,7 +12,17 @@ const PORT = 3000;
 
 app.use(express.json({ limit: '10mb' }));
 
-// ==================== GROQ AI CLIENT ====================
+// ==================== AI CLIENTS (GEMINI & GROQ) ====================
+let geminiClient: GoogleGenAI | null = null;
+function getGeminiClient(): GoogleGenAI | null {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return null;
+  if (!geminiClient) {
+    geminiClient = new GoogleGenAI({ apiKey });
+  }
+  return geminiClient;
+}
+
 let groqClient: Groq | null = null;
 function getGroqClient(): Groq | null {
   const apiKey = process.env.GROQ_API_KEY;
@@ -956,17 +967,86 @@ app.delete('/api/admin/admins/:adminId', async (req, res) => {
   }
 });
 
-// ==================== GROQ AI ROUTES (llama-3.3-70b-versatile) ====================
+// ==================== AI ROUTES (GEMINI & GROQ) ====================
+
+// AI Magic Fill: Extract structured details from raw bio text
+app.post('/api/parse-bio', async (req, res) => {
+  try {
+    const { userText } = req.body;
+    if (!userText || typeof userText !== 'string' || !userText.trim()) {
+      return res.status(400).json({ error: 'userText is required' });
+    }
+
+    const groq = getGroqClient();
+    const gemini = getGeminiClient();
+
+    if (!groq && !gemini) {
+      return res.status(503).json({
+        error: 'AI is not configured. Please set the GROQ_API_KEY or GEMINI_API_KEY environment variable.',
+      });
+    }
+
+    const systemPrompt = `You are an expert bio information extractor. Extract user details from the text into a clean JSON object containing: name, title, bio, email, phone, whatsapp, facebook, linkedin, instagram, twitter, youtube, github, website.
+Extract the most accurate and complete value for each key from the provided text. For phone/whatsapp numbers, keep international format if present. For social platforms, extract either the profile URL or handle.
+If a field is not found in the input text, set its value to null or an empty string "".
+Ensure the output is strictly valid JSON matching the required schema.`;
+
+    let parsedObject: any = {};
+
+    if (groq) {
+      const completion = await groq.chat.completions.create({
+        model: 'llama-3.3-70b-versatile',
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userText },
+        ],
+        temperature: 0.1,
+      });
+
+      const rawContent = completion.choices[0]?.message?.content?.trim() || '{}';
+      try {
+        parsedObject = JSON.parse(rawContent);
+      } catch (e) {
+        console.error('Failed to parse Groq response as JSON:', rawContent);
+        parsedObject = {};
+      }
+    } else if (gemini) {
+      const response = await gemini.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: `${systemPrompt}\n\nUser input text to extract from:\n${userText}`,
+        config: {
+          responseMimeType: 'application/json',
+        },
+      });
+
+      const rawContent = response.text?.trim() || '{}';
+      try {
+        parsedObject = JSON.parse(rawContent);
+      } catch (e) {
+        console.error('Failed to parse Gemini response as JSON:', rawContent);
+        parsedObject = {};
+      }
+    }
+
+    return res.json({ success: true, data: parsedObject });
+  } catch (err: any) {
+    console.error('Parse bio error:', err?.message || err);
+    res.status(500).json({ error: err?.message || 'Failed to parse bio text' });
+  }
+});
 
 // Generate Professional Bio
 app.post('/api/ai/generate-bio', async (req, res) => {
   try {
     const { fullName, jobTitle, company, tone = 'professional', keywords = '', existingBio = '' } = req.body;
 
+    const gemini = getGeminiClient();
     const groq = getGroqClient();
-    if (!groq) {
+
+    if (!gemini && !groq) {
       return res.status(503).json({
-        error: 'Groq API is not configured. Please set the GROQ_API_KEY environment variable.',
+        error: 'AI is not configured. Please set the GEMINI_API_KEY or GROQ_API_KEY environment variable.',
       });
     }
 
@@ -980,21 +1060,32 @@ Company: ${company || ''}
 Key Skills/Keywords: ${keywords || 'None provided'}
 Existing Bio context: ${existingBio || 'None'}`;
 
-    const completion = await groq.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-      ],
-      temperature: 0.7,
-      max_tokens: 250,
-    });
+    if (gemini) {
+      const response = await gemini.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: `${systemPrompt}\n\n${userPrompt}`,
+      });
+      const bio = response.text?.trim() || '';
+      return res.json({ success: true, bio });
+    }
 
-    const bio = completion.choices[0]?.message?.content?.trim() || '';
-    res.json({ success: true, bio });
+    if (groq) {
+      const completion = await groq.chat.completions.create({
+        model: 'llama-3.3-70b-versatile',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        temperature: 0.7,
+        max_tokens: 250,
+      });
+
+      const bio = completion.choices[0]?.message?.content?.trim() || '';
+      return res.json({ success: true, bio });
+    }
   } catch (err: any) {
-    console.error('Groq bio generation error:', err?.message || err);
-    res.status(500).json({ error: err?.message || 'Failed to generate bio with Groq' });
+    console.error('Bio generation error:', err?.message || err);
+    res.status(500).json({ error: err?.message || 'Failed to generate bio' });
   }
 });
 
@@ -1003,10 +1094,12 @@ app.post('/api/ai/suggest-links', async (req, res) => {
   try {
     const { fullName, jobTitle, company, bio } = req.body;
 
+    const gemini = getGeminiClient();
     const groq = getGroqClient();
-    if (!groq) {
+
+    if (!gemini && !groq) {
       return res.status(503).json({
-        error: 'Groq API is not configured. Please set the GROQ_API_KEY environment variable.',
+        error: 'AI is not configured. Please set the GEMINI_API_KEY or GROQ_API_KEY environment variable.',
       });
     }
 
@@ -1026,17 +1119,26 @@ Job Title: ${jobTitle || 'Specialist'}
 Company: ${company || 'Independent'}
 Bio: ${bio || ''}`;
 
-    const completion = await groq.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-      ],
-      temperature: 0.6,
-      max_tokens: 400,
-    });
+    let raw = '[]';
+    if (gemini) {
+      const response = await gemini.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: `${systemPrompt}\n\n${userPrompt}`,
+      });
+      raw = response.text?.trim() || '[]';
+    } else if (groq) {
+      const completion = await groq.chat.completions.create({
+        model: 'llama-3.3-70b-versatile',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        temperature: 0.6,
+        max_tokens: 400,
+      });
+      raw = completion.choices[0]?.message?.content?.trim() || '[]';
+    }
 
-    let raw = completion.choices[0]?.message?.content?.trim() || '[]';
     raw = raw.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/i, '').trim();
 
     let suggestions = [];
@@ -1049,8 +1151,8 @@ Bio: ${bio || ''}`;
 
     res.json({ success: true, suggestions });
   } catch (err: any) {
-    console.error('Groq link suggestion error:', err?.message || err);
-    res.status(500).json({ error: err?.message || 'Failed to suggest links with Groq' });
+    console.error('Link suggestion error:', err?.message || err);
+    res.status(500).json({ error: err?.message || 'Failed to suggest links' });
   }
 });
 
@@ -1060,36 +1162,56 @@ app.post('/api/ai/chat', async (req, res) => {
     const { message, history = [] } = req.body;
     if (!message) return res.status(400).json({ error: 'Message is required' });
 
+    const gemini = getGeminiClient();
     const groq = getGroqClient();
-    if (!groq) {
+
+    if (!gemini && !groq) {
       return res.status(503).json({
-        error: 'Groq API is not configured. Please set the GROQ_API_KEY environment variable.',
+        error: 'AI is not configured. Please set the GEMINI_API_KEY or GROQ_API_KEY environment variable.',
       });
     }
 
     const systemPrompt = `You are Zyro AI, the intelligent assistant for Zyro Cards (the NFC Smart Digital Business Card platform). You help entrepreneurs, sales professionals, and admins optimize their NFC cards, write elevator pitches, learn how to program NTAG215/216 chips, and grow their networking efficiency. Be concise, actionable, and friendly.`;
 
-    const messages = [
-      { role: 'system', content: systemPrompt },
-      ...history.map((h: any) => ({
-        role: h.role === 'user' ? 'user' : 'assistant',
-        content: String(h.content || ''),
-      })),
-      { role: 'user', content: String(message) },
-    ];
+    if (gemini) {
+      const promptParts = [
+        systemPrompt,
+        ...history.map((h: any) => `${h.role === 'user' ? 'User' : 'Assistant'}: ${h.content || ''}`),
+        `User: ${message}`,
+      ].join('\n\n');
 
-    const completion = await groq.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
-      messages: messages as any,
-      temperature: 0.7,
-      max_tokens: 600,
-    });
+      const response = await gemini.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: promptParts,
+      });
 
-    const reply = completion.choices[0]?.message?.content?.trim() || '';
-    res.json({ success: true, reply });
+      const reply = response.text?.trim() || '';
+      return res.json({ success: true, reply });
+    }
+
+    if (groq) {
+      const messages = [
+        { role: 'system', content: systemPrompt },
+        ...history.map((h: any) => ({
+          role: h.role === 'user' ? 'user' : 'assistant',
+          content: String(h.content || ''),
+        })),
+        { role: 'user', content: String(message) },
+      ];
+
+      const completion = await groq.chat.completions.create({
+        model: 'llama-3.3-70b-versatile',
+        messages: messages as any,
+        temperature: 0.7,
+        max_tokens: 600,
+      });
+
+      const reply = completion.choices[0]?.message?.content?.trim() || '';
+      return res.json({ success: true, reply });
+    }
   } catch (err: any) {
-    console.error('Groq chat error:', err?.message || err);
-    res.status(500).json({ error: err?.message || 'Groq AI request failed' });
+    console.error('AI chat error:', err?.message || err);
+    res.status(500).json({ error: err?.message || 'AI request failed' });
   }
 });
 
@@ -1099,31 +1221,46 @@ app.post('/api/ai/generate-copy', async (req, res) => {
     const { prompt, type = 'tagline' } = req.body;
     if (!prompt) return res.status(400).json({ error: 'Prompt is required' });
 
+    const gemini = getGeminiClient();
     const groq = getGroqClient();
-    if (!groq) {
+
+    if (!gemini && !groq) {
       return res.status(503).json({
-        error: 'Groq API is not configured. Please set the GROQ_API_KEY environment variable.',
+        error: 'AI is not configured. Please set the GEMINI_API_KEY or GROQ_API_KEY environment variable.',
       });
     }
 
-    const completion = await groq.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
-      messages: [
-        {
-          role: 'system',
-          content: `You are an expert copywriter for digital business cards. Write concise, punchy copy (${type}). Output ONLY the text.`,
-        },
-        { role: 'user', content: prompt },
-      ],
-      temperature: 0.7,
-      max_tokens: 200,
-    });
+    const systemInstruction = `You are an expert copywriter for digital business cards. Write concise, punchy copy (${type}). Output ONLY the text.`;
 
-    const result = completion.choices[0]?.message?.content?.trim() || '';
-    res.json({ success: true, result });
+    if (gemini) {
+      const response = await gemini.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: `${systemInstruction}\n\n${prompt}`,
+      });
+      const result = response.text?.trim() || '';
+      return res.json({ success: true, result });
+    }
+
+    if (groq) {
+      const completion = await groq.chat.completions.create({
+        model: 'llama-3.3-70b-versatile',
+        messages: [
+          {
+            role: 'system',
+            content: systemInstruction,
+          },
+          { role: 'user', content: prompt },
+        ],
+        temperature: 0.7,
+        max_tokens: 200,
+      });
+
+      const result = completion.choices[0]?.message?.content?.trim() || '';
+      return res.json({ success: true, result });
+    }
   } catch (err: any) {
-    console.error('Groq copy generation error:', err?.message || err);
-    res.status(500).json({ error: err?.message || 'Failed to generate copy with Groq' });
+    console.error('Copy generation error:', err?.message || err);
+    res.status(500).json({ error: err?.message || 'Failed to generate copy' });
   }
 });
 
