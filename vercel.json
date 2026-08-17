@@ -2,7 +2,7 @@
   "rewrites": [
     {
       "source": "/api/:path*",
-      "destination": "https://zyro-cards-backend.onrender.com/api/:path*"
+      "destination": "https://zyro-cards3.onrender.com/api/:path*"
     },
     {
       "source": "/c/:path*",
