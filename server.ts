@@ -18,7 +18,14 @@ function getGeminiClient(): GoogleGenAI | null {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) return null;
   if (!geminiClient) {
-    geminiClient = new GoogleGenAI({ apiKey });
+    geminiClient = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
+      },
+    });
   }
   return geminiClient;
 }
@@ -969,6 +976,68 @@ app.delete('/api/admin/admins/:adminId', async (req, res) => {
 
 // ==================== AI ROUTES (GEMINI & GROQ) ====================
 
+// Cache for available Groq models to avoid hardcoding decommissioned models
+let cachedGroqModels: string[] | null = null;
+let lastGroqModelFetch = 0;
+
+async function getAvailableGroqModels(groq: any): Promise<string[]> {
+  const now = Date.now();
+  if (cachedGroqModels && cachedGroqModels.length > 0 && now - lastGroqModelFetch < 300000) {
+    return cachedGroqModels;
+  }
+
+  // Known high-performance, general-purpose Groq chat models in priority order
+  const priorityModels = [
+    'llama-3.3-70b-versatile',
+    'llama-3.1-8b-instant',
+    'deepseek-r1-distill-llama-70b',
+    'qwen/qwen-2.5-32b',
+    'qwen-2.5-32b',
+    'meta-llama/llama-3.3-70b-instruct',
+    'meta-llama/llama-3.1-8b-instruct',
+  ];
+
+  try {
+    if (groq?.models?.list) {
+      const list = await groq.models.list();
+      if (list?.data && Array.isArray(list.data)) {
+        const availableIds = new Set(list.data.map((m: any) => m.id));
+        // Filter priority models that actually exist on this account
+        const matchedPriority = priorityModels.filter(id => availableIds.has(id));
+
+        // Add any other active chat models, excluding audio, guard, speech, terms-required or non-chat models
+        const otherActiveModels = list.data
+          .map((m: any) => m.id)
+          .filter((id: string) =>
+            id &&
+            !id.includes('whisper') &&
+            !id.includes('guard') &&
+            !id.includes('canopylabs') &&
+            !id.includes('orpheus') &&
+            !id.includes('playai') &&
+            !id.includes('audio') &&
+            !id.includes('tts') &&
+            !id.includes('stt') &&
+            !id.includes('embed') &&
+            !id.includes('vision') &&
+            !matchedPriority.includes(id)
+          );
+
+        const ordered = [...matchedPriority, ...otherActiveModels];
+        if (ordered.length > 0) {
+          cachedGroqModels = ordered;
+          lastGroqModelFetch = now;
+          return cachedGroqModels;
+        }
+      }
+    }
+  } catch (e: any) {
+    console.warn('Could not query Groq models list:', e?.message || e);
+  }
+
+  return priorityModels;
+}
+
 // Helper to reliably execute Groq calls with active supported models
 async function callGroqWithFallback(groq: any, options: {
   messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>;
@@ -976,9 +1045,10 @@ async function callGroqWithFallback(groq: any, options: {
   temperature?: number;
   max_tokens?: number;
 }) {
-  const candidateModels = [
-    'llama-3.1-8b-instant',
+  const dynamicModels = await getAvailableGroqModels(groq);
+  const candidateModels = dynamicModels.length > 0 ? dynamicModels : [
     'llama-3.3-70b-versatile',
+    'llama-3.1-8b-instant',
   ];
 
   let lastError: any = null;
@@ -987,7 +1057,7 @@ async function callGroqWithFallback(groq: any, options: {
       const completion = await groq.chat.completions.create({
         model: modelName,
         messages: options.messages as any,
-        response_format: options.response_format,
+        ...(options.response_format ? { response_format: options.response_format } : {}),
         temperature: options.temperature ?? 0.1,
         ...(options.max_tokens ? { max_tokens: options.max_tokens } : {}),
       });
@@ -995,15 +1065,229 @@ async function callGroqWithFallback(groq: any, options: {
     } catch (err: any) {
       lastError = err;
       const msg = err?.message || String(err);
-      const isNotFoundError = err?.status === 404 || msg.includes('does not exist') || msg.includes('decommissioned') || msg.includes('not have access');
-      if (isNotFoundError) {
-        console.warn(`Groq model '${modelName}' not available (${msg}). Attempting next fallback model...`);
+      const isRecoverableError =
+        err?.status === 404 ||
+        err?.status === 400 ||
+        err?.status === 429 ||
+        err?.status === 503 ||
+        msg.includes('does not exist') ||
+        msg.includes('decommissioned') ||
+        msg.includes('not have access') ||
+        msg.includes('model_not_found') ||
+        msg.includes('model_decommissioned') ||
+        msg.includes('terms_required') ||
+        msg.includes('terms acceptance') ||
+        msg.includes('high demand') ||
+        msg.includes('rate limit');
+      if (isRecoverableError) {
+        console.warn(`Groq model '${modelName}' unavailable (${msg}). Attempting next candidate...`);
         continue;
       }
       throw err;
     }
   }
   throw lastError;
+}
+
+// Helper to reliably execute Gemini calls with modern supported models and demand-spike fallback
+async function callGeminiWithFallback(gemini: any, options: {
+  contents: string | any;
+  config?: any;
+}) {
+  const candidateModels = [
+    'gemini-3.7-flash',
+    'gemini-3.6-flash',
+    'gemini-3.5-flash-lite',
+    'gemini-3.5-flash',
+    'gemini-flash-latest',
+    'gemini-pro-latest',
+  ];
+
+  let lastError: any = null;
+  for (const modelName of candidateModels) {
+    try {
+      const response = await gemini.models.generateContent({
+        model: modelName,
+        contents: options.contents,
+        ...(options.config ? { config: options.config } : {}),
+      });
+      return response;
+    } catch (err: any) {
+      lastError = err;
+      const msg = err?.message || String(err);
+      const isRecoverable =
+        err?.status === 404 ||
+        err?.status === 503 ||
+        err?.status === 429 ||
+        msg.includes('404') ||
+        msg.includes('503') ||
+        msg.includes('429') ||
+        msg.includes('no longer available') ||
+        msg.includes('not found') ||
+        msg.includes('high demand') ||
+        msg.includes('UNAVAILABLE') ||
+        msg.includes('RESOURCE_EXHAUSTED');
+      if (isRecoverable) {
+        console.warn(`Gemini model '${modelName}' unavailable (${msg}). Trying next fallback model...`);
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastError;
+}
+
+// Resilient JSON extractor that handles markdown fences, chat conversational prefixes ("Sure!"), and nested objects
+function safeJsonParse(rawText: string, defaultValue: any = null): any {
+  if (!rawText || typeof rawText !== 'string') return defaultValue;
+  const text = rawText.trim();
+  if (!text) return defaultValue;
+
+  // 1. Direct JSON parse
+  try {
+    return JSON.parse(text);
+  } catch {}
+
+  // 2. Strip Markdown code blocks
+  const markdownCleaned = text
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+  try {
+    return JSON.parse(markdownCleaned);
+  } catch {}
+
+  // 3. Find JSON object substring { ... }
+  const firstBrace = text.indexOf('{');
+  const lastBrace = text.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    try {
+      const candidate = text.substring(firstBrace, lastBrace + 1);
+      return JSON.parse(candidate);
+    } catch {}
+  }
+
+  // 4. Find JSON array substring [ ... ]
+  const firstBracket = text.indexOf('[');
+  const lastBracket = text.lastIndexOf(']');
+  if (firstBracket !== -1 && lastBracket > firstBracket) {
+    try {
+      const candidate = text.substring(firstBracket, lastBracket + 1);
+      return JSON.parse(candidate);
+    } catch {}
+  }
+
+  return defaultValue;
+}
+
+// High-accuracy deterministic fallback extractor for user bios
+function parseBioDeterministically(text: string): Record<string, any> {
+  const result: Record<string, any> = {
+    name: '',
+    title: '',
+    bio: '',
+    email: '',
+    phone: '',
+    whatsapp: '',
+    facebook: '',
+    linkedin: '',
+    instagram: '',
+    twitter: '',
+    youtube: '',
+    github: '',
+    website: '',
+  };
+
+  if (!text || typeof text !== 'string') return result;
+
+  const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+
+  // 1. Email extraction
+  const emailMatch = text.match(/[\w.+-]+@[\w-]+\.[\w.-]+/);
+  if (emailMatch) result.email = emailMatch[0];
+
+  // 2. Phone extraction
+  const phoneMatch = text.match(/(?:(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,4})/);
+  if (phoneMatch) result.phone = phoneMatch[0].trim();
+
+  // 3. Key-value line parsing
+  for (const line of lines) {
+    const matchKV = line.match(/^(name|full\s*name|title|job\s*title|role|company|position|bio|about|phone|mobile|tel|whatsapp|wa|email|mail|linkedin|facebook|instagram|twitter|x|youtube|github|website|site|url)\s*[:=-]\s*(.+)$/i);
+    if (matchKV) {
+      const key = matchKV[1].toLowerCase().replace(/\s+/g, '');
+      const val = matchKV[2].trim();
+      if (key === 'name' || key === 'fullname') result.name = val;
+      else if (key === 'title' || key === 'jobtitle' || key === 'role' || key === 'position') result.title = val;
+      else if (key === 'bio' || key === 'about') result.bio = val;
+      else if (key === 'email' || key === 'mail') result.email = val;
+      else if (key === 'phone' || key === 'mobile' || key === 'tel') result.phone = val;
+      else if (key === 'whatsapp' || key === 'wa') result.whatsapp = val;
+      else if (key === 'linkedin') result.linkedin = val;
+      else if (key === 'facebook') result.facebook = val;
+      else if (key === 'instagram') result.instagram = val;
+      else if (key === 'twitter' || key === 'x') result.twitter = val;
+      else if (key === 'youtube') result.youtube = val;
+      else if (key === 'github') result.github = val;
+      else if (key === 'website' || key === 'site' || key === 'url') result.website = val;
+    }
+  }
+
+  // 4. Social URLs extraction
+  const linkedinMatch = text.match(/(?:https?:\/\/)?(?:www\.)?linkedin\.com\/(?:in|company)\/([a-zA-Z0-9_-]+)/i);
+  if (linkedinMatch && !result.linkedin) result.linkedin = linkedinMatch[0];
+
+  const fbMatch = text.match(/(?:https?:\/\/)?(?:www\.)?facebook\.com\/([a-zA-Z0-9_.-]+)/i);
+  if (fbMatch && !result.facebook) result.facebook = fbMatch[0];
+
+  const instaMatch = text.match(/(?:https?:\/\/)?(?:www\.)?instagram\.com\/([a-zA-Z0-9_.-]+)/i);
+  if (instaMatch && !result.instagram) result.instagram = instaMatch[0];
+
+  const twitterMatch = text.match(/(?:https?:\/\/)?(?:www\.)?(?:twitter|x)\.com\/([a-zA-Z0-9_]+)/i);
+  if (twitterMatch && !result.twitter) result.twitter = twitterMatch[0];
+
+  const ytMatch = text.match(/(?:https?:\/\/)?(?:www\.)?youtube\.com\/(?:@|c\/|channel\/)?([a-zA-Z0-9_.-]+)/i);
+  if (ytMatch && !result.youtube) result.youtube = ytMatch[0];
+
+  const ghMatch = text.match(/(?:https?:\/\/)?(?:www\.)?github\.com\/([a-zA-Z0-9_-]+)/i);
+  if (ghMatch && !result.github) result.github = ghMatch[0];
+
+  const waMatch = text.match(/(?:https?:\/\/)?(?:wa\.me\/|api\.whatsapp\.com\/send\?phone=)(\+?\d+)/i);
+  if (waMatch && !result.whatsapp) result.whatsapp = waMatch[1];
+  else if (!result.whatsapp && result.phone) result.whatsapp = result.phone;
+
+  // 5. General Website URL
+  const webMatch = text.match(/https?:\/\/(?!(?:www\.)?(?:linkedin|facebook|instagram|twitter|x|youtube|github)\.com|wa\.me)[\w.-]+\.[a-zA-Z]{2,}[^\s]*/i);
+  if (webMatch && !result.website) result.website = webMatch[0];
+
+  // 6. Name and Title heuristic from first non-KV lines
+  if (!result.name && lines.length > 0) {
+    const candidateName = lines[0];
+    if (!candidateName.includes('@') && !candidateName.includes('http') && candidateName.length < 50) {
+      result.name = candidateName;
+      if (!result.title && lines.length > 1) {
+        const candidateTitle = lines[1];
+        if (!candidateTitle.includes('@') && !candidateTitle.includes('http') && candidateTitle.length < 60) {
+          result.title = candidateTitle;
+        }
+      }
+    }
+  }
+
+  // 7. Bio heuristic from longer sentences
+  if (!result.bio) {
+    const descriptive = lines.filter(l =>
+      l.length > 25 &&
+      !l.startsWith('http') &&
+      !l.includes('@') &&
+      l !== result.name &&
+      l !== result.title
+    );
+    if (descriptive.length > 0) {
+      result.bio = descriptive.join(' ');
+    }
+  }
+
+  return result;
 }
 
 // AI Magic Fill: Extract structured details from raw bio text
@@ -1017,76 +1301,74 @@ app.post('/api/parse-bio', async (req, res) => {
     const groq = getGroqClient();
     const gemini = getGeminiClient();
 
-    if (!groq && !gemini) {
-      return res.status(503).json({
-        error: 'AI is not configured. Please set the GROQ_API_KEY or GEMINI_API_KEY environment variable.',
-      });
-    }
-
     const systemPrompt = `You are an expert bio information extractor. Extract user details from the text into a clean JSON object containing: name, title, bio, email, phone, whatsapp, facebook, linkedin, instagram, twitter, youtube, github, website.
 Extract the most accurate and complete value for each key from the provided text. For phone/whatsapp numbers, keep international format if present. For social platforms, extract either the profile URL or handle.
 If a field is not found in the input text, set its value to null or an empty string "".
-Ensure the output is strictly valid JSON matching the required schema.`;
+Respond ONLY with a valid JSON object. Do not include conversational text, introductory words like "Sure", markdown formatting, or explanations.`;
 
     let parsedObject: any = {};
+    let parsedSuccessfully = false;
 
+    // 1. Try Groq if configured
     if (groq) {
       try {
-        const completion = await groq.chat.completions.create({
-          model: "llama-3.1-8b-instant",
-          response_format: { type: "json_object" },
+        const completion = await callGroqWithFallback(groq, {
           messages: [
-            { role: "system", content: systemPrompt },
-            { role: "user", content: userText },
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userText },
           ],
+          response_format: { type: 'json_object' },
           temperature: 0.1,
         });
 
-        const rawContent = completion.choices[0]?.message?.content?.trim() || "{}";
-        try {
-          parsedObject = JSON.parse(rawContent);
-        } catch (e) {
-          console.error("Failed to parse Groq response as JSON:", rawContent);
-          parsedObject = {};
+        const rawContent = completion.choices[0]?.message?.content?.trim() || '{}';
+        const parsed = safeJsonParse(rawContent, null);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          parsedObject = parsed;
+          parsedSuccessfully = true;
+        } else {
+          console.warn('Groq response could not be parsed as object, trying Gemini...');
         }
       } catch (groqErr: any) {
-        console.error("Groq parsing failed, falling back to Gemini if configured:", groqErr?.message || groqErr);
-        if (gemini) {
-          const response = await gemini.models.generateContent({
-            model: "gemini-2.5-flash",
-            contents: `${systemPrompt}\n\nUser input text to extract from:\n${userText}`,
-            config: {
-              responseMimeType: "application/json",
-            },
-          });
-          const rawContent = response.text?.trim() || "{}";
-          parsedObject = JSON.parse(rawContent);
-        } else {
-          throw groqErr;
-        }
+        console.warn('Groq parsing failed, attempting Gemini...', groqErr?.message || groqErr);
       }
-    } else if (gemini) {
-      const response = await gemini.models.generateContent({
-        model: "gemini-2.5-flash",
-        contents: `${systemPrompt}\n\nUser input text to extract from:\n${userText}`,
-        config: {
-          responseMimeType: "application/json",
-        },
-      });
+    }
 
-      const rawContent = response.text?.trim() || "{}";
+    // 2. Try Gemini if Groq was not available or failed
+    if (!parsedSuccessfully && gemini) {
       try {
-        parsedObject = JSON.parse(rawContent);
-      } catch (e) {
-        console.error("Failed to parse Gemini response as JSON:", rawContent);
-        parsedObject = {};
+        const response = await callGeminiWithFallback(gemini, {
+          contents: `${systemPrompt}\n\nUser input text to extract from:\n${userText}`,
+          config: {
+            responseMimeType: 'application/json',
+          },
+        });
+        const rawContent = response.text?.trim() || '{}';
+        const parsed = safeJsonParse(rawContent, null);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          parsedObject = parsed;
+          parsedSuccessfully = true;
+        }
+      } catch (geminiErr: any) {
+        console.warn('Gemini parsing failed, activating deterministic extractor...', geminiErr?.message || geminiErr);
       }
+    }
+
+    // 3. Guaranteed Deterministic Fallback if AI services encounter demand spikes/rate limits
+    if (!parsedSuccessfully) {
+      console.log('Utilizing deterministic NLP parser for bio extraction.');
+      parsedObject = parseBioDeterministically(userText);
     }
 
     return res.json({ success: true, data: parsedObject });
   } catch (err: any) {
-    console.error("Parse bio error:", err?.message || err);
-    res.status(500).json({ error: err?.message || "Failed to parse bio text" });
+    console.error('Parse bio error:', err?.message || err);
+    try {
+      const fallback = parseBioDeterministically(req.body?.userText || '');
+      return res.json({ success: true, data: fallback });
+    } catch {
+      res.status(500).json({ error: err?.message || 'Failed to parse bio text' });
+    }
   }
 });
 
@@ -1115,12 +1397,16 @@ Key Skills/Keywords: ${keywords || 'None provided'}
 Existing Bio context: ${existingBio || 'None'}`;
 
     if (gemini) {
-      const response = await gemini.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: `${systemPrompt}\n\n${userPrompt}`,
-      });
-      const bio = response.text?.trim() || '';
-      return res.json({ success: true, bio });
+      try {
+        const response = await callGeminiWithFallback(gemini, {
+          contents: `${systemPrompt}\n\n${userPrompt}`,
+        });
+        const bio = response.text?.trim() || '';
+        return res.json({ success: true, bio });
+      } catch (geminiErr) {
+        if (!groq) throw geminiErr;
+        console.warn('Gemini failed in bio generation, trying Groq...');
+      }
     }
 
     if (groq) {
@@ -1174,12 +1460,18 @@ Bio: ${bio || ''}`;
 
     let raw = '[]';
     if (gemini) {
-      const response = await gemini.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: `${systemPrompt}\n\n${userPrompt}`,
-      });
-      raw = response.text?.trim() || '[]';
-    } else if (groq) {
+      try {
+        const response = await callGeminiWithFallback(gemini, {
+          contents: `${systemPrompt}\n\n${userPrompt}`,
+        });
+        raw = response.text?.trim() || '[]';
+      } catch (geminiErr) {
+        if (!groq) throw geminiErr;
+        console.warn('Gemini link suggestion failed, falling back to Groq...');
+      }
+    }
+    
+    if (raw === '[]' && groq) {
       const completion = await callGroqWithFallback(groq, {
         messages: [
           { role: 'system', content: systemPrompt },
@@ -1191,15 +1483,9 @@ Bio: ${bio || ''}`;
       raw = completion.choices[0]?.message?.content?.trim() || '[]';
     }
 
-    raw = raw.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/i, '').trim();
-
     let suggestions = [];
-    try {
-      const parsed = JSON.parse(raw);
-      suggestions = Array.isArray(parsed) ? parsed : (parsed.suggestions || parsed.links || []);
-    } catch {
-      suggestions = [];
-    }
+    const parsed = safeJsonParse(raw, []);
+    suggestions = Array.isArray(parsed) ? parsed : (parsed?.suggestions || parsed?.links || []);
 
     res.json({ success: true, suggestions });
   } catch (err: any) {
@@ -1226,19 +1512,23 @@ app.post('/api/ai/chat', async (req, res) => {
     const systemPrompt = `You are Zyro AI, the intelligent assistant for Zyro Cards (the NFC Smart Digital Business Card platform). You help entrepreneurs, sales professionals, and admins optimize their NFC cards, write elevator pitches, learn how to program NTAG215/216 chips, and grow their networking efficiency. Be concise, actionable, and friendly.`;
 
     if (gemini) {
-      const promptParts = [
-        systemPrompt,
-        ...history.map((h: any) => `${h.role === 'user' ? 'User' : 'Assistant'}: ${h.content || ''}`),
-        `User: ${message}`,
-      ].join('\n\n');
+      try {
+        const promptParts = [
+          systemPrompt,
+          ...history.map((h: any) => `${h.role === 'user' ? 'User' : 'Assistant'}: ${h.content || ''}`),
+          `User: ${message}`,
+        ].join('\n\n');
 
-      const response = await gemini.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: promptParts,
-      });
+        const response = await callGeminiWithFallback(gemini, {
+          contents: promptParts,
+        });
 
-      const reply = response.text?.trim() || '';
-      return res.json({ success: true, reply });
+        const reply = response.text?.trim() || '';
+        return res.json({ success: true, reply });
+      } catch (geminiErr) {
+        if (!groq) throw geminiErr;
+        console.warn('Gemini chat failed, trying Groq...');
+      }
     }
 
     if (groq) {
@@ -1284,12 +1574,16 @@ app.post('/api/ai/generate-copy', async (req, res) => {
     const systemInstruction = `You are an expert copywriter for digital business cards. Write concise, punchy copy (${type}). Output ONLY the text.`;
 
     if (gemini) {
-      const response = await gemini.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: `${systemInstruction}\n\n${prompt}`,
-      });
-      const result = response.text?.trim() || '';
-      return res.json({ success: true, result });
+      try {
+        const response = await callGeminiWithFallback(gemini, {
+          contents: `${systemInstruction}\n\n${prompt}`,
+        });
+        const result = response.text?.trim() || '';
+        return res.json({ success: true, result });
+      } catch (geminiErr) {
+        if (!groq) throw geminiErr;
+        console.warn('Gemini copy generation failed, trying Groq...');
+      }
     }
 
     if (groq) {
