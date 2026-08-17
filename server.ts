@@ -969,7 +969,7 @@ app.delete('/api/admin/admins/:adminId', async (req, res) => {
 
 // ==================== AI ROUTES (GEMINI & GROQ) ====================
 
-// Helper to reliably execute Groq calls with automatic fallback to standard available models
+// Helper to reliably execute Groq calls with active supported models
 async function callGroqWithFallback(groq: any, options: {
   messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>;
   response_format?: { type: 'json_object' };
@@ -977,11 +977,8 @@ async function callGroqWithFallback(groq: any, options: {
   max_tokens?: number;
 }) {
   const candidateModels = [
-    'llama-3.3-70b-versatile',
     'llama-3.1-8b-instant',
-    'llama3-8b-8192',
-    'llama3-70b-8192',
-    'mixtral-8x7b-32768',
+    'llama-3.3-70b-versatile',
   ];
 
   let lastError: any = null;
@@ -1035,33 +1032,34 @@ Ensure the output is strictly valid JSON matching the required schema.`;
 
     if (groq) {
       try {
-        const completion = await callGroqWithFallback(groq, {
+        const completion = await groq.chat.completions.create({
+          model: "llama-3.1-8b-instant",
+          response_format: { type: "json_object" },
           messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userText },
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userText },
           ],
-          response_format: { type: 'json_object' },
           temperature: 0.1,
         });
 
-        const rawContent = completion.choices[0]?.message?.content?.trim() || '{}';
+        const rawContent = completion.choices[0]?.message?.content?.trim() || "{}";
         try {
           parsedObject = JSON.parse(rawContent);
         } catch (e) {
-          console.error('Failed to parse Groq response as JSON:', rawContent);
+          console.error("Failed to parse Groq response as JSON:", rawContent);
           parsedObject = {};
         }
       } catch (groqErr: any) {
-        console.error('Groq parsing failed, falling back to Gemini if configured:', groqErr?.message || groqErr);
+        console.error("Groq parsing failed, falling back to Gemini if configured:", groqErr?.message || groqErr);
         if (gemini) {
           const response = await gemini.models.generateContent({
-            model: 'gemini-2.5-flash',
+            model: "gemini-2.5-flash",
             contents: `${systemPrompt}\n\nUser input text to extract from:\n${userText}`,
             config: {
-              responseMimeType: 'application/json',
+              responseMimeType: "application/json",
             },
           });
-          const rawContent = response.text?.trim() || '{}';
+          const rawContent = response.text?.trim() || "{}";
           parsedObject = JSON.parse(rawContent);
         } else {
           throw groqErr;
@@ -1069,26 +1067,26 @@ Ensure the output is strictly valid JSON matching the required schema.`;
       }
     } else if (gemini) {
       const response = await gemini.models.generateContent({
-        model: 'gemini-2.5-flash',
+        model: "gemini-2.5-flash",
         contents: `${systemPrompt}\n\nUser input text to extract from:\n${userText}`,
         config: {
-          responseMimeType: 'application/json',
+          responseMimeType: "application/json",
         },
       });
 
-      const rawContent = response.text?.trim() || '{}';
+      const rawContent = response.text?.trim() || "{}";
       try {
         parsedObject = JSON.parse(rawContent);
       } catch (e) {
-        console.error('Failed to parse Gemini response as JSON:', rawContent);
+        console.error("Failed to parse Gemini response as JSON:", rawContent);
         parsedObject = {};
       }
     }
 
     return res.json({ success: true, data: parsedObject });
   } catch (err: any) {
-    console.error('Parse bio error:', err?.message || err);
-    res.status(500).json({ error: err?.message || 'Failed to parse bio text' });
+    console.error("Parse bio error:", err?.message || err);
+    res.status(500).json({ error: err?.message || "Failed to parse bio text" });
   }
 });
 
